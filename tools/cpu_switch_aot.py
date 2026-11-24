@@ -1834,7 +1834,8 @@ class Program:
         self.host_cpu = host_cpu
         self.imports = imports or {}
         self.entries = Entries(pe, bindings)
-        self.active = []  # (entry, internal) of each translation in progress, outermost first
+        self.active = []  # entry of each translation in progress, outermost first
+        self.internal = []  # whether each of those is an internal function
         self.lows = []  # per active translation: the lowest active depth it has used a summary from
         self.assumed = {}
         self.pending = []  # (entry, source, function, low) of cycle functions not yet kept
@@ -1844,12 +1845,14 @@ class Program:
         self.import_resolver = None
 
     def lift(self, entry, symbol, arguments, internal=False):
-        self.active.append((entry, internal))
+        self.active.append(entry)
+        self.internal.append(internal)
         self.lows.append(len(self.active) - 1)
         try:
             return lift_function(self, entry, symbol, arguments, internal)
         finally:
             self.active.pop()
+            self.internal.pop()
             self.low = self.lows.pop()
             if self.lows:
                 self.lows[-1] = min(self.lows[-1], self.low)
@@ -1869,7 +1872,8 @@ class Program:
             if entry == target:
                 self.depends(low)
                 return function
-        depth = next((d for d, (entry, internal) in enumerate(self.active) if internal and entry == target), None)
+        depth = next((d for d, (entry, internal) in enumerate(zip(self.active, self.internal))
+                      if internal and entry == target), None)
         if depth is not None:
             self.depends(depth)
             return self.assumed.setdefault(target, Assumed(target, 8, {}))
