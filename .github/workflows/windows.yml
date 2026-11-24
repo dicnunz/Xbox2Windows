@@ -222,7 +222,7 @@ jobs:
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 150
     env:
       SCCACHE_CACHE_SIZE: '2G'
     steps:
@@ -324,7 +324,7 @@ jobs:
     name: Build and test on Windows at /O2
     if: github.event_name != 'pull_request'
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 150
     env:
       SCCACHE_CACHE_SIZE: '2G'
     steps:
