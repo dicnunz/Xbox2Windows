@@ -1194,6 +1194,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_switch_rotates COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_rotates_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_rotates>" "$<TARGET_FILE:cpu_switch_rotates_lifted>")
+    cpu_asm_fixture(cpu_switch_shift_flags switch_shift_flags)
+    cpu_translation(cpu_switch_shift_flags cpu_switch_aot
+        shl1_8,shr1_8,sar1_8,shl1_16,shr1_16,sar1_16,shl1_32,shr1_32,sar1_32,shl1_64,shr1_64,sar1_64,shln_8,shrn_8,sarn_8,shln_16,shrn_16,sarn_16,shln_32,shrn_32,sarn_32,shln_64,shrn_64,sarn_64,shlw_16,sarw_8,shlw_64,shln_32m,jcc_shl64_o,jcc_shr32_b,jcc_sar16_s,jcc_shl8_be,jcc_sar64_g,jcc_shr8_ge,jcc_shrn_np,cmov_shift)
+    add_test(NAME cpu_aot_switch_shift_flags COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_shift_flags_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_shift_flags>" "$<TARGET_FILE:cpu_switch_shift_flags_lifted>")
     # Divides whose results are unused: the translation is also built with /O2, where the compiler would remove a
     # divide that the generated C++ let it remove, and both builds are compared with the original's exception codes.
     cpu_asm_fixture(cpu_dead_div dead_div)

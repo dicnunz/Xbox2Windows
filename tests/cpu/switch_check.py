@@ -403,8 +403,8 @@ def check_flag_rejections(original_path):
         raise AssertionError("unexpected flag_select encoding")
     controls = [
         (setl.ip, bytes.fromhex("0f 9c c4"), "unsupported register"),  # SETL AH
-        # SHL writes the flags, so CMOVGE may no longer read those of the CMP.
-        (between.ip, bytes.fromhex("d1 e0"), "unsupported flag producer"),
+        # ROL writes CF and OF, so CMOVGE may no longer read those of the CMP.
+        (between.ip, bytes.fromhex("d1 c0"), "unsupported flag producer"),
         # A second entry at SETBE would reach it with the flags of another path.
         (jump.ip + 1, struct.pack("b", setbe.ip - jump.next_ip), "flags cross a join"),
     ]

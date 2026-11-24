@@ -27,6 +27,15 @@ parity conditions use the producer operand width, including narrow arithmetic.
 Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc, and
 CBW, CWDE, CDQE, CDQ and CQO) may sit between them.
 
+SHL, SHR and SAR produce flags only with an immediate count whose masked value
+(five bits, six for a 64-bit operand) is 1 to the operand width minus 1. A count
+of 0 leaves the flags of an earlier instruction, which a shift by CL may do, and
+CF is undefined for SHL and SHR by the operand width or more, so those are
+refused, and SAR by such a count with them. CF is the last bit
+shifted out and ZF, SF and PF come from the result. OF is defined only for a
+count of 1 (MSB of the result XOR CF for SHL, MSB of the operand for SHR, 0 for
+SAR), so O, NO, L, GE, LE and G are refused after a larger count.
+
 One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
 and RDX without naming them. Products of up to 32-bit factors are computed in
 std::uint64_t; 64-bit products and all quotients use the MSVC intrinsics
@@ -200,7 +209,7 @@ STRING_TRANSFERS = {
 # which only read them.
 FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -930,6 +939,22 @@ class Lifter:
                      "le": f"static_cast<{s}>({a}) <= static_cast<{s}>({b})",
                      "g": f"static_cast<{s}>({a}) > static_cast<{s}>({b})",
                      "s": f"static_cast<{s}>({flag_result}) < 0", "ns": f"static_cast<{s}>({flag_result}) >= 0"}
+        elif producer.mnemonic in SHIFTS:
+            # fa is the result; bit 0 of fb is CF and bit 1 is OF (see lower()).
+            flag_result = f"static_cast<{u}>(fa)"
+            carry, zero = "((fb & 1u) != 0)", f"{flag_result} == 0"
+            s_cond = f"static_cast<{s}>({flag_result}) < 0"
+            table = {"e": zero, "ne": f"{flag_result} != 0", "s": s_cond,
+                     "ns": f"static_cast<{s}>({flag_result}) >= 0",
+                     "b": carry, "ae": f"!{carry}", "be": f"{carry} || {zero}", "a": f"!{carry} && !({zero})"}
+            overflow = None
+            if shift_count(producer) == 1:
+                overflow = "((fb & 2u) != 0)"
+                table.update({"l": f"({s_cond}) != {overflow}", "ge": f"({s_cond}) == {overflow}",
+                              "le": f"{zero} || ({s_cond}) != {overflow}",
+                              "g": f"!({zero}) && ({s_cond}) == {overflow}"})
+            elif code in ("o", "no", "l", "ge", "le", "g"):
+                raise ValueError(f"OF is undefined after a shift by more than 1 at RVA {jcc.ip:#x}")
         else:
             if producer.mnemonic == M.ADD:
                 flag_result = f"static_cast<{u}>({a} + {b})"
@@ -964,8 +989,9 @@ class Lifter:
                                   "be": "true", "a": "false"})
         # PF is even parity of only the low result byte. OF is signed overflow,
         # independent of the host's signed arithmetic and its overflow rules.
-        table.update({"o": overflow, "no": f"!({overflow})",
-                      "p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
+        table.update({"p": f"even_parity({flag_result})", "np": f"!even_parity({flag_result})"})
+        if overflow is not None:
+            table.update({"o": overflow, "no": f"!({overflow})"})
         if code not in table:
             raise ValueError(f"unsupported condition after {producer.mnemonic} at RVA {jcc.ip:#x}")
         return table[code]
@@ -1093,9 +1119,19 @@ class Lifter:
             return line, reads, writes
         if mnemonic in (*SHIFTS, *ROTATES):
             if sets_flags:
-                raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
+                if mnemonic in ROTATES:
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}")
+                if ins.op1_kind == OpKind.REGISTER:
+                    # A masked count of 0 leaves the flags unchanged, so they may come from an earlier instruction.
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}: a shift by CL may leave the flags unchanged")
+                if shift_count(ins) == 0:
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}: a zero-count shift leaves the flags unchanged")
+                if shift_count(ins) >= width * 8:
+                    # CF is undefined for SHL and SHR (Intel SDM, SAL/SAR/SHL/SHR); SAR is refused with them.
+                    raise ValueError(f"unsupported flag producer at RVA {ins.ip:#x}: "
+                                     "a shift by the operand width or more (CF is undefined for SHL and SHR)")
             note(0)
-            a = self.operand(ins, 0, width)
+            a = source = self.operand(ins, 0, width)
             # x86 masks the count to six bits for 64-bit operands and to five bits otherwise.
             # Shifts widen to 64 bits (count < 64, no host overflow) and truncate on write;
             # rotates mask modulo the operand width inside rotate_bits.
@@ -1115,6 +1151,19 @@ class Lifter:
                 else:
                     a = f"static_cast<std::uint64_t>({a})"
                 value = f"{a} {SHIFTS[mnemonic]} {count}"
+            if sets_flags:
+                # CF is the last bit shifted out. OF, defined only for a count of 1, is the MSB of the
+                # result XOR CF for SHL, the MSB of the operand for SHR and 0 for SAR.
+                self.flags = True
+                bits, n, wide = width * 8, shift_count(ins), f"static_cast<std::uint64_t>({source})"
+                carry = f"(({wide} >> {bits - n if mnemonic == M.SHL else n - 1}) & 1u)"
+                overflow = "0u"
+                if n == 1 and mnemonic == M.SHL:
+                    overflow = f"((({wide} >> {bits - 1}) ^ ({wide} >> {bits - 2})) & 1u)"
+                elif n == 1 and mnemonic == M.SHR:
+                    overflow = f"(({wide} >> {bits - 1}) & 1u)"
+                return (f"fa = static_cast<{unsigned(width)}>({value}); fb = {carry} | ({overflow} << 1); "
+                        + self.write(ins, width, "fa")), reads, writes
             return self.write(ins, width, value), reads, writes
         if mnemonic == M.IMUL and ins.op_count in (2, 3):
             # The two-operand form reads its destination; the three-operand form only writes it.
@@ -1207,6 +1256,12 @@ class Lifter:
             # Which bytes of RAX are a return value is decided by the definedness pass in lift().
             return "return rax;", {}, {}
         raise ValueError(f"unsupported instruction at RVA {ins.ip:#x}: {ins}")
+
+
+def shift_count(ins):
+    """The immediate count of a shift, masked as x86 does: to six bits for a 64-bit operand, else five."""
+    width = RegisterExt.size(ins.op0_register) if ins.op0_kind == OpKind.REGISTER else _memory_width(ins)
+    return ins.immediate(1) & (63 if width == 8 else 31)
 
 
 def _memory_width(ins):
