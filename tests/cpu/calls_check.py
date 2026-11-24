@@ -122,6 +122,9 @@ def layout(pe, export_rva):
         raise AssertionError(f"no call in {name}")
 
     rvas.update(leaf=first_call("call_leaf"), mid=first_call("chain3"), low=first_call("narrow_call"))
+    data = pe.get_data(rvas["chain3"], 64)
+    rvas["chain3_call"] = next(ins.ip for ins in Decoder(64, data, ip=rvas["chain3"])
+                               if ins.flow_control == FlowControl.CALL)
     return rvas
 
 
@@ -193,9 +196,9 @@ CONTROLS = [
     # first call left undefined.
     ("call_leaf", [("call_leaf", 0x0d, "48 89 03 48 83 c0 01", ("call", "leaf"))], "callee argument rcx is undefined"),
     ("narrow_call", [("narrow_call", 0x0d, "0f b6 c0", "0f 94 c0")], "flags clobbered by the call"),
-    # mid_step reads the fifth-argument slot above its caller's home area.
+    # mid_step reads the fifth-argument slot above its caller's home area, where chain3 pushed RSI.
     ("chain3", [("mid", 0x11, "48 03 44 24 20", "48 03 44 24 50")],
-     "callee at RVA {mid:#x} refused: unsupported stack argument"),
+     "stack argument 5 of the call at RVA {chain3_call:#x} holds a saved register"),
     # An unsupported instruction in leaf_mix refuses mid_step and with it chain3.
     ("chain3", [("leaf", 0x04, "48 03 c2", "0f a2 90")],
      "callee at RVA {mid:#x} refused: callee at RVA {leaf:#x} refused: unsupported instruction"),

@@ -20,8 +20,9 @@ defined at entry and the generated function has a fourth parameter. "name" and
 "name:3" take three, and R9 is a scratch register that must be written before it
 is read; any other count is rejected. The count is chosen by whoever invokes the
 translator, not derived from the machine code, and the host must call the
-translated function with the same number of arguments. Stack arguments (the
-fifth and later) and floating-point arguments are not supported.
+translated function with the same number of arguments. An export's stack
+arguments (the fifth and later) and floating-point arguments are not supported;
+an internal callee may take stack arguments, as described below.
 
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Overflow and low-byte
@@ -110,8 +111,8 @@ would let the frame's address escape. Both are rejected. The frame becomes one
 byte array per call, from the lowest RSP up to the end of the caller's 32-byte
 home space at entry RSP + 40, at most MAX_FRAME bytes, and each RSP-based
 operand a load or store at a constant index into it. An access below the
-current RSP (Windows x64 has no red zone), of the return address or at or
-above entry RSP + 40 (a stack argument) is rejected. A second pass follows
+current RSP (Windows x64 has no red zone), of the return address or, in an
+export, at or above entry RSP + 40 (a stack argument) is rejected. A second pass follows
 every stack byte: a read needs each byte written on every path, so home space
 must be written before it is read. RBX, RBP, RSI, RDI and R12-R15 may be used
 when every RET is reached with each one holding its entry value again, saved
@@ -139,8 +140,16 @@ undefined because the frame proof forgets the bytes that ADD RSP, POP and LEAVE
 leave below RSP. RSP must be 8
 mod 16 from entry at a call, with the callee's home space below the return
 address. A tail jump is checked as a RET and contributes the callee's return
-width. The callee's frame is its own array, so no frame address crosses a call,
-and stack arguments stay refused.
+width. The callee's frame is its own array, so no frame address crosses a call.
+
+An internal function may read and write up to MAX_STACK_ARGUMENTS stack
+arguments, the 8-byte slots from entry RSP + 40, each access inside one slot. Its
+frame array extends over them, copied at entry from one parameter per slot after
+R9, and it records how many low bytes of each slot some read reaches. A caller
+must have those bytes written at RSP + 32 + 8 * slot when the CALL executes, below
+its own return address, and passes the 8 bytes of each slot. Afterwards the slots
+are undefined, like the callee's home space, because the callee may write them.
+A tail jump to a function with stack arguments is refused.
 
 A CALL may close a call cycle, an export's own entry included, which becomes an
 internal function too. A call into a function whose translation is in progress
@@ -224,6 +233,8 @@ HOME_END = 40
 MAX_FRAME = 4096
 # The home space a callee may write: the 32 bytes at RSP when the CALL executes.
 HOME_SIZE = 32
+# Stack arguments an internal function may take: the fifth to the twelfth, 8 bytes each from entry RSP + 40.
+MAX_STACK_ARGUMENTS = 8
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 # Flow that continues at the next instruction (a direct call does once its callee returns).
 STRAIGHT = (FlowControl.NEXT, FlowControl.CONDITIONAL_BRANCH, FlowControl.CALL, FlowControl.INDIRECT_CALL)
@@ -1466,7 +1477,10 @@ class Frame:
     frame_limit = MAX_FRAME
     incoming_end = HOME_END
 
-    def __init__(self, function, edges):
+    def __init__(self, function, edges, internal=False):
+        if internal:
+            # An internal function may read the stack arguments its callers write above its home space.
+            self.incoming_end = HOME_END + 8 * MAX_STACK_ARGUMENTS
         self.offsets, self.accesses, self.adjustments, self.released = {function.entry: 0}, {}, set(), {}
         self.output_calls = {}
         self.output_addresses = {}
@@ -1524,9 +1538,17 @@ class Frame:
             if offset < self.offsets[ip] + HOME_SIZE or offset % width:
                 raise ValueError(f"misaligned stack output or overlap with callee home space at RVA {ip:#x}")
             self.outputs[ip] = (offset, width)
+        # Per stack argument slot: the low bytes that some read reaches, 0 for a slot only written.
+        slots = {}
+        for offset, width, reads, _ in self.accesses.values():
+            if offset >= HOME_END:
+                slot = (offset - HOME_END) // 8
+                slots[slot] = max(slots.get(slot, 0), offset + width - HOME_END - 8 * slot if reads else 0)
+        self.stack = tuple(slots.get(slot, 0) for slot in range(max(slots, default=-1) + 1))
         low = min(self.offsets.values())
         self.start = low - (low + 8) % 16
-        self.size = HOME_END - self.start
+        self.end = HOME_END + 8 * len(self.stack)
+        self.size = self.end - self.start
         if self.size > self.frame_limit:
             raise ValueError(f"frame of {self.size} bytes exceeds the {self.frame_limit}-byte bound")
 
@@ -1535,7 +1557,8 @@ class Frame:
             raise ValueError(f"stack access below RSP at RVA {ins.ip:#x}")
         if offset < 8 and offset + width > 0:
             raise ValueError(f"return address slot accessed at RVA {ins.ip:#x}")
-        if offset + width > self.incoming_end:
+        if offset + width > HOME_END and (offset + width > self.incoming_end or offset < HOME_END
+                                          or (offset - HOME_END) // 8 != (offset + width - 1 - HOME_END) // 8):
             raise ValueError(f"unsupported stack argument at RVA {ins.ip:#x}: entry RSP{offset:+#x}")
         self.accesses[ins.ip] = (offset, width, reads, writes)
 
@@ -1639,7 +1662,7 @@ def slot_register(ins):
     return None
 
 
-def prove_frame(function, order, effects, frame):
+def prove_frame(function, order, effects, frame, stacks=None):
     """Check that every stack byte is written before it is read and that every RET is reached with each
     nonvolatile register holding its entry value, on every path.
 
@@ -1652,6 +1675,8 @@ def prove_frame(function, order, effects, frame):
     as data, so its register read is removed from effects before the register pass."""
     instructions = function.instructions
     saved = {register: bytes(range(2 + 8 * i, 10 + 8 * i)) for i, register in enumerate(NONVOLATILE)}
+    # Per call: the low bytes of each stack argument that the callee may read.
+    stacks = stacks or {}
 
     def step(ip, status, data):
         if ip in function.calls:
@@ -1659,8 +1684,10 @@ def prove_frame(function, order, effects, frame):
             # callee's frame lie below RSP, where every byte is already 0: no access is below RSP, and the
             # bytes that ADD RSP and POP leave below RSP become 0. The rest of the frame, including this
             # function's own home space above entry RSP, is kept.
+            # It may also write the stack arguments above that home space.
             index = frame.offsets[ip] - frame.start
-            data = data[:index] + bytes(HOME_SIZE) + data[index + HOME_SIZE:]
+            size = HOME_SIZE + 8 * len(stacks.get(ip, ()))
+            data = data[:index] + bytes(size) + data[index + size:]
             if ip in frame.outputs:
                 offset, width = frame.outputs[ip]
                 index = offset - frame.start
@@ -1683,7 +1710,9 @@ def prove_frame(function, order, effects, frame):
                 status[register] = "entry" if register == restored else "written"
         return tuple(status.values()), data
 
-    state = {function.entry: (("entry",) * len(NONVOLATILE), bytes(frame.size))}
+    # The caller writes the stack arguments before the call.
+    state = {function.entry: (("entry",) * len(NONVOLATILE),
+                              bytes(HOME_END - frame.start) + b"\1" * (frame.end - HOME_END))}
     work = [function.entry]
     while work:
         ip = work.pop()
@@ -1705,6 +1734,14 @@ def prove_frame(function, order, effects, frame):
             if status.get(read, "written") != "written":
                 raise ValueError(f"nonvolatile register {NAMES[read]} may hold the caller's value where RVA "
                                  f"{ip:#x} reads it")
+        for slot, needed in enumerate(stacks.get(ip, ())):
+            index = frame.offsets[ip] + HOME_SIZE + 8 * slot - frame.start
+            passed = data[index:index + needed]
+            if passed != b"\1" * needed:
+                at = index + frame.start + (passed.index(0) if 0 in passed else 0)
+                raise ValueError(f"stack argument {5 + slot} of the call at RVA {ip:#x} is undefined at entry "
+                                 f"RSP{at:+#x}" if 0 in passed else
+                                 f"stack argument {5 + slot} of the call at RVA {ip:#x} holds a saved register")
         got = data[offset - frame.start:offset - frame.start + width]
         if loads and got != b"\1" * width and not (register is not None and got == saved[register]):
             if 0 in got:
@@ -1804,17 +1841,25 @@ class HostImport(NamedTuple):
 
 
 class Assumed(NamedTuple):
-    """The summary that calls into a function still being translated use: its return width and
-    argument demands, assumed until its translation computes them."""
+    """The summary that calls into a function still being translated use: its return width,
+    argument demands and stack argument demands, assumed until its translation computes them."""
     entry: int
     return_width: int
     demands: dict
+    stack: tuple = ()
+
+
+def parameters(registers, stack=()):
+    """The C++ parameters of a function: its argument registers, then one word per stack argument."""
+    return ", ".join([f"word {NAMES[r]}" for r in registers] + [f"word arg{5 + slot}" for slot in range(len(stack))])
 
 
 def at_least_as_good(computed, assumed):
     """Whether a computed summary defines at least the assumed RAX bytes and demands no more."""
     return (computed.return_width >= assumed.return_width
-            and all(width <= assumed.demands.get(r, 0) for r, width in computed.demands.items()))
+            and all(width <= assumed.demands.get(r, 0) for r, width in computed.demands.items())
+            and len(computed.stack) <= len(assumed.stack)
+            and all(width <= assumed.stack[slot] for slot, width in enumerate(computed.stack)))
 
 
 class Program:
@@ -1898,7 +1943,10 @@ class Program:
             demands = {r: max(width, function.demands.get(r, 0))
                        for r, width in assumed.demands.items()} | {
                        r: width for r, width in function.demands.items() if r not in assumed.demands}
-            self.assumed[target] = Assumed(target, min(assumed.return_width, function.return_width), demands)
+            slots = max(len(assumed.stack), len(function.stack))
+            stack = tuple(max(assumed.stack[slot] if slot < len(assumed.stack) else 0,
+                              function.stack[slot] if slot < len(function.stack) else 0) for slot in range(slots))
+            self.assumed[target] = Assumed(target, min(assumed.return_width, function.return_width), demands, stack)
             del self.pending[start:]
         if self.low < depth:
             # Part of a cycle through a function below it on the stack, which keeps it when that is done.
@@ -1911,8 +1959,8 @@ class Program:
         del self.pending[start:]
         cyclic = [self.assumed.pop(entry, None) for entry, _, _ in members]
         if any(cyclic) or len(members) > 1:
-            self.sources.append("\n".join(f"static word fn_{entry:x}({', '.join(f'word {NAMES[r]}' for r in ARGUMENT_REGISTERS)});"
-                                          for entry, _, _ in sorted(members, key=lambda m: m[0])))
+            self.sources.append("\n".join(f"static word fn_{entry:x}({parameters(ARGUMENT_REGISTERS, member.stack)});"
+                                          for entry, _, member in sorted(members, key=lambda m: m[0])))
         for entry, text, member in members:
             self.callees[entry] = member
             self.sources.append(text)
@@ -1965,7 +2013,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     bases = {(base, anchor) for *_, (_, _, base, anchor) in function.dispatches.values()}
     order = sorted(function.instructions)
     instructions = function.instructions
-    frame = Frame(function, edges)
+    frame = Frame(function, edges, internal)
     if internal and not function.unwound:
         # Without unwind data a function may not move RSP, so it cannot push, allocate or call.
         moved = sorted(ip for ip, offset in frame.offsets.items() if offset or ip in function.calls)
@@ -1987,6 +2035,14 @@ def lift_function(program, entry, symbol, arguments, internal):
         if not program.committed(callees[ip]):
             # The original runs a cycle of tail jumps in constant stack; the host call does not.
             raise ValueError(f"tail jump within a call cycle at RVA {ip:#x}")
+    # Per call: the low bytes of each stack argument that the callee may read.
+    stacks = {ip: callee.stack for ip, callee in callees.items() if getattr(callee, "stack", ())}
+    for ip, stack in sorted(stacks.items()):
+        if ip in function.tails:
+            # The stack arguments would be this function's own, which its caller wrote.
+            raise ValueError(f"tail jump to a function with stack arguments at RVA {ip:#x}")
+        if frame.offsets[ip] + HOME_SIZE + 8 * len(stack) > 0:
+            raise ValueError(f"stack arguments of the call at RVA {ip:#x} reach the return address")
     loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
     body = {}
@@ -2004,7 +2060,11 @@ def lift_function(program, entry, symbol, arguments, internal):
                              for r in callee.demands]
                 call = f"{callee.symbol}({', '.join(call_args)})"
             else:
-                call = f"fn_{callee.entry:x}({', '.join(lifter.reg(r) for r in ARGUMENT_REGISTERS)})"
+                # Stack arguments are passed by value from the bytes above the callee's home space.
+                passed = [lifter.reg(r) for r in ARGUMENT_REGISTERS] + [
+                    f"load<word>(reinterpret_cast<word>(frame + {frame.offsets[ip] + HOME_SIZE + 8 * slot - frame.start}))"
+                    for slot in range(len(stacks.get(ip, ())))]
+                call = f"fn_{callee.entry:x}({', '.join(passed)})"
             # A tail jump returns the callee's RAX; a call leaves it in RAX.
             if isinstance(callee, HostImport) and callee.return_width == 0:
                 body[ip] = f"{call}; return 0;" if ip in function.tails else f"{call};"
@@ -2059,7 +2119,7 @@ def lift_function(program, entry, symbol, arguments, internal):
               for ip, ins in instructions.items()
               if ins.mnemonic == M.MOV and ins.op0_kind == ins.op1_kind == OpKind.REGISTER
               and RegisterExt.size(ins.op0_register) >= 4 and full(ins.op0_register) in effects[ip][1]}
-    prove_frame(function, order, effects, frame)
+    prove_frame(function, order, effects, frame, stacks)
 
     # Per register: (low bytes defined on every path: 0, 1, 2 or 8; may hold a guest address that
     # the translation does not reproduce). Arguments are defined at entry; joins meet as (min, or).
@@ -2116,6 +2176,11 @@ def lift_function(program, entry, symbol, arguments, internal):
     # Consecutive low RAX bytes defined at every reachable RET or tail jump; None when there is none.
     function.return_width = min(widths) if widths else None
     function.demands = argument_demands(function, order, effects)
+    # Calls in a cycle pass the stack arguments the assumed summary names; the definition takes them all.
+    assumed = program.assumed.get(entry) if internal else None
+    stack = frame.stack + (0,) * max(0, len(assumed.stack) - len(frame.stack)) if assumed else frame.stack
+    function.stack = tuple(max(width, assumed.stack[slot] if assumed and slot < len(assumed.stack) else 0)
+                           for slot, width in enumerate(stack))
 
     labels = set(edges)
     if order[0] != entry:
@@ -2139,7 +2204,10 @@ def lift_function(program, entry, symbol, arguments, internal):
         declarations.append("word fa = 0, fb = 0;")
     if lifter.frame:
         declarations.append(f"alignas(16) std::uint8_t frame[{frame.size}] = {{}};  "
-                            f"// entry RSP{frame.start:+#x} to entry RSP+{HOME_END:#x}")
+                            f"// entry RSP{frame.start:+#x} to entry RSP+{frame.end:#x}")
+    for slot, width in enumerate(frame.stack):
+        if width:
+            declarations.append(f"std::memcpy(frame + {HOME_END + 8 * slot - frame.start}, &arg{5 + slot}, 8);")
     text = [f"    goto loc_{entry:x};"] if order[0] != entry else []
     for position, ip in enumerate(order):
         if ip in labels:
@@ -2151,7 +2219,7 @@ def lift_function(program, entry, symbol, arguments, internal):
         if ins.flow_control in STRAIGHT and function.successors[ip] and following != ins.next_ip:
             text.append(f"    goto loc_{ins.next_ip:x};")
     linkage = "static" if internal else 'extern "C" __declspec(dllexport)'
-    signature = f'{linkage} word {symbol}({", ".join(f"word {NAMES[r]}" for r in function.arguments)})'
+    signature = f'{linkage} word {symbol}({parameters(function.arguments, function.stack)})'
     comment = []
     if function.return_width is None:
         comment = ["// RAX: no reachable normal return"]

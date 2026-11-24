@@ -3108,6 +3108,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_recursion COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/recursion_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_recursion>" "$<TARGET_FILE:cpu_recursion_lifted>")
+    cpu_asm_fixture(cpu_stack_args stack_args)
+    # The exports from unset_slot on exist only to be refused; the test translates each alone.
+    cpu_translation(cpu_stack_args cpu_switch_aot call_six,call_seven,call_scratch,call_rec,call_eight)
+    add_test(NAME cpu_aot_stack_arguments COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/stack_args_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_stack_args>" "$<TARGET_FILE:cpu_stack_args_lifted>")
     cpu_asm_fixture(cpu_call_entries call_entries)
     cpu_translation(cpu_call_entries cpu_switch_aot entry_caller,entry_tail)
     add_test(NAME cpu_aot_call_entries COMMAND "${INTAKE_PYTHON}" -B
