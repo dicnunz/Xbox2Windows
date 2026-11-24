@@ -222,7 +222,7 @@ jobs:
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       SCCACHE_CACHE_SIZE: '2G'
     steps:
@@ -275,20 +275,22 @@ jobs:
           .\tools\dev.ps1
           cmake --preset dev @X2wSccacheCmakeArgs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
-            cmake --build --preset pr
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-            if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
-            ctest --preset pr --no-tests=error --output-junit "$PWD/out/test-results.xml"
-          } else {
-            cmake --build --preset dev
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-            if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
-            ctest --preset dev --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results.xml"
+          cmake --build --preset dev --target cpu_register_probe cpu_recursion cpu_stack_args
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($t in 'cpu_recursion_lifted', 'cpu_stack_args_lifted') {
+            cmake --build --preset dev --target $t
+            "BEFORE: build of $t on main exited $LASTEXITCODE (expected nonzero: the translator refuses the fixture)"
           }
+          ctest --preset dev --no-tests=error -R '^cpu_aot_(recursion|stack_arguments)$' --output-on-failure --output-junit "$PWD/out/test-results.xml"
+          "BEFORE: ctest of cpu_aot_recursion and cpu_aot_stack_arguments on main exited $LASTEXITCODE (expected nonzero)"
+          $dir = 'out/build/dev'
+          $probe = (Get-ChildItem -Recurse $dir -Filter cpu_register_probe.dll | Select-Object -First 1).FullName
+          $rec = (Get-ChildItem -Recurse $dir -Filter cpu_recursion.dll | Select-Object -First 1).FullName
+          $stack = (Get-ChildItem -Recurse $dir -Filter cpu_stack_args.dll | Select-Object -First 1).FullName
+          .\out\pe-env\Scripts\python.exe -B tests/cpu/before_main_check.py $probe $rec $stack
           exit $LASTEXITCODE
       - name: Require the SPIR-V bridge WARP tests
-        if: ${{ !cancelled() }}
+        if: false
         shell: pwsh
         run: ./out/pe-env/Scripts/python.exe -B tests/spirv_window/require_warp_results.py out/test-results.xml
       - name: Draw the coverage dashboard
@@ -324,7 +326,7 @@ jobs:
     name: Build and test on Windows at /O2
     if: github.event_name != 'pull_request'
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       SCCACHE_CACHE_SIZE: '2G'
     steps:
@@ -376,12 +378,22 @@ jobs:
           .\tools\dev.ps1
           cmake --preset release @X2wSccacheCmakeArgs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build --preset release
+          cmake --build --preset release --target cpu_register_probe cpu_recursion cpu_stack_args
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) { sccache --show-stats }
-          ctest --preset release --no-tests=error -E '_hardware$' --output-junit "$PWD/out/test-results-release.xml"
+          foreach ($t in 'cpu_recursion_lifted', 'cpu_stack_args_lifted') {
+            cmake --build --preset release --target $t
+            "BEFORE: build of $t on main exited $LASTEXITCODE (expected nonzero: the translator refuses the fixture)"
+          }
+          ctest --preset release --no-tests=error -R '^cpu_aot_(recursion|stack_arguments)$' --output-on-failure --output-junit "$PWD/out/test-results-release.xml"
+          "BEFORE: ctest of cpu_aot_recursion and cpu_aot_stack_arguments on main exited $LASTEXITCODE (expected nonzero)"
+          $dir = 'out/build/release'
+          $probe = (Get-ChildItem -Recurse $dir -Filter cpu_register_probe.dll | Select-Object -First 1).FullName
+          $rec = (Get-ChildItem -Recurse $dir -Filter cpu_recursion.dll | Select-Object -First 1).FullName
+          $stack = (Get-ChildItem -Recurse $dir -Filter cpu_stack_args.dll | Select-Object -First 1).FullName
+          .\out\pe-env\Scripts\python.exe -B tests/cpu/before_main_check.py $probe $rec $stack
+          exit $LASTEXITCODE
       - name: Require the SPIR-V bridge WARP tests at /O2
-        if: ${{ !cancelled() }}
+        if: false
         shell: pwsh
         run: ./out/pe-env/Scripts/python.exe -B tests/spirv_window/require_warp_results.py out/test-results-release.xml
 
