@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from direct_check import GUARDS, MASK, SENTINELS, observe, register_probe
 
 MASK32 = 0xffffffff
-EXPORTS = ("call_six", "call_seven", "call_scratch", "call_rec", "call_eight")
+EXPORTS = ("call_six", "call_seven", "call_scratch", "call_rec", "call_eight", "call_fill", "call_edge", "call_twelfth")
 # (export, expected refusal), translated alone.
 REFUSED = (
     ("unset_slot", "stack argument 6 of the call at RVA {unset_slot_call:#x} is undefined at entry RSP-0x10"),
@@ -23,10 +23,16 @@ REFUSED = (
     ("reread_slot", "undefined stack byte at entry RSP-0x18"),
     ("tail_six", "tail jump to a function with stack arguments"),
     ("export_fifth", "unsupported stack argument at RVA {export_fifth:#x}: entry RSP+0x28"),
-    ("far_slot", "callee at RVA {far_ninth:#x} refused: unsupported stack argument"),
-    ("straddle_slot", "callee at RVA {straddle:#x} refused: unsupported stack argument"),
+    ("far_slot", "callee at RVA {far_ninth:#x} refused: unsupported stack argument at RVA {far_ninth:#x}: "
+                 "entry RSP+0x68"),
+    ("straddle_slot", "callee at RVA {straddle:#x} refused: unsupported stack argument at RVA {straddle:#x}: "
+                      "entry RSP+0x24"),
     ("high_slots", "stack arguments of the call at RVA {high_slots_call:#x} reach the return address"),
+    ("lost_slot", "callee at RVA {rec_lost:#x} refused: stack argument 5 of the call at RVA {rec_lost_call:#x} "
+                  "is undefined at entry RSP-0x18"),
 )
+# Refused only because a cycle's first summary is translated again.
+ITERATED = ("lost_slot",)
 
 # Refused only because the frame proof follows the stack arguments of each call.
 UNPROVEN = ("unset_slot", "narrow_slot", "reread_slot")
@@ -79,6 +85,18 @@ def call_rec(x, y):
 def call_eight(x, y):
     value = eight_sum(x, y, (x + y) & MASK, (x - y) & MASK, y, x, x ^ y, y)
     return value, trace(second=value)
+
+
+def call_fill(x, y):
+    return 3 * x & MASK, trace()
+
+
+def call_edge(x, y):
+    return scratch_five(y, x, x), trace()
+
+
+def call_twelfth(x, y):
+    return x ^ y, trace()
 
 
 REFERENCES = {name: globals()[name] for name in EXPORTS}
@@ -136,6 +154,10 @@ def layout(pe, export_rva, aot):
     (_, rvas["eight_sum"]), = calls(rvas["call_eight"])
     (_, rvas["far_ninth"]), = calls(rvas["far_slot"])
     (_, rvas["straddle"]), = calls(rvas["straddle_slot"])
+    (_, rvas["fill_five"]), = calls(rvas["call_fill"])
+    (_, rvas["twelfth"]), = calls(rvas["call_twelfth"])
+    (_, rvas["rec_lost"]), = calls(rvas["lost_slot"])
+    (rvas["rec_lost_call"], _), = calls(rvas["rec_lost"])
     for name in ("unset_slot", "narrow_slot", "high_slots"):
         (rvas[f"{name}_call"], _), = calls(rvas[name])
     return rvas
@@ -164,7 +186,7 @@ def check_structure(original_path):
             aot.lift(pe, name, program=program)
     # Low bytes of each stack argument that some read of the callee reaches.
     want = {"six_mix": (8, 4), "seven_fwd": (8, 8, 1), "scratch_five": (8,), "rec_five": (8,),
-            "eight_sum": (8, 8, 8, 2)}
+            "eight_sum": (8, 8, 8, 2), "fill_five": (0,), "twelfth": (0,) * 7 + (8,)}
     stacks = {name: program.callees[rvas[name]].stack for name in want}
     if stacks != want:
         raise AssertionError(f"stack argument demands {stacks} != {want}")
@@ -204,6 +226,18 @@ def check_refusals(original_path):
             print(f"control {name}: accepted when the frame proof ignores stack arguments")
     finally:
         aot.prove_frame = prove
+    # The planted fault: keep a cycle's first summary, however it compares with the assumption.
+    iterate = aot.at_least_as_good
+    aot.at_least_as_good = lambda computed, assumed: True
+    try:
+        for name in ITERATED:
+            try:
+                aot.translate(original_path, [name])
+            except ValueError as error:
+                raise AssertionError(f"{name} is refused without the iteration: {error}") from error
+            print(f"control {name}: accepted when the first summary of a cycle is kept")
+    finally:
+        aot.at_least_as_good = iterate
     print(f"{len(REFUSED)} stack argument rejection controls passed")
 
 

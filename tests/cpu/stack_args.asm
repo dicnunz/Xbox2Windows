@@ -92,6 +92,38 @@ eight_sum PROC FRAME
     ret
 eight_sum ENDP
 
+; fill_five(a, b, c, d, e): writes a to its fifth-argument slot without reading it; returns 3a.
+fill_five PROC FRAME
+    .endprolog
+    mov qword ptr [rsp+28h], rcx
+    lea rax, [rcx+rcx*2]
+    ret
+fill_five ENDP
+
+; twelfth(a, ..., l) = a XOR l: the twelfth argument, in the last supported slot.
+twelfth PROC FRAME
+    .endprolog
+    mov rax, qword ptr [rsp+60h]
+    xor rax, rcx
+    ret
+twelfth ENDP
+
+; rec_lost(n, b, c, d, e): e when n = 0, otherwise rec_lost(n - 1, ...) without writing its fifth
+; argument. Refused through lost_slot below.
+rec_lost PROC FRAME
+    sub rsp, 38h
+    .allocstack 38h
+    .endprolog
+    mov rax, qword ptr [rsp+60h]
+    test rcx, rcx
+    jz rec_lost_done
+    dec rcx
+    call rec_lost
+rec_lost_done:
+    add rsp, 38h
+    ret
+rec_lost ENDP
+
 ; trace[0] = six_mix(x, y, x XOR y, y + 1, x, y AND 0FFFFFFFFh); returns it. Only the low
 ; doubleword of the sixth argument is written.
 call_six PROC FRAME
@@ -217,6 +249,56 @@ call_eight PROC FRAME
     pop rbx
     ret
 call_eight ENDP
+
+; Returns fill_five(x, ...) = 3x. fill_five reads none of its stack arguments, so this caller
+; writes no stack byte, and its one slot ends exactly at this function's return address.
+call_fill PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    call fill_five
+    add rsp, 28h
+    ret
+call_fill ENDP
+
+; Returns scratch_five(y, x, 0, 0, x) = (x + y) XOR x, with its slot ending exactly at the return address.
+call_edge PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    mov qword ptr [rsp+20h], rcx
+    mov rax, rcx
+    mov rcx, rdx
+    mov rdx, rax
+    xor r8d, r8d
+    xor r9d, r9d
+    call scratch_five
+    add rsp, 28h
+    ret
+call_edge ENDP
+
+; Returns twelfth(x, ..., y) = x XOR y; only the twelfth argument is written.
+call_twelfth PROC FRAME
+    sub rsp, 68h
+    .allocstack 68h
+    .endprolog
+    mov qword ptr [rsp+58h], rdx
+    call twelfth
+    add rsp, 68h
+    ret
+call_twelfth ENDP
+
+; Refused: rec_lost calls itself without writing the fifth argument it reads.
+lost_slot PROC FRAME
+    sub rsp, 38h
+    .allocstack 38h
+    .endprolog
+    mov qword ptr [rsp+20h], rdx
+    xor r9d, r9d
+    call rec_lost
+    add rsp, 38h
+    ret
+lost_slot ENDP
 
 ; Refused: the sixth argument of six_mix is never written.
 unset_slot PROC FRAME

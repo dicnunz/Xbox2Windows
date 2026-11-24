@@ -2060,10 +2060,11 @@ def lift_function(program, entry, symbol, arguments, internal):
                              for r in callee.demands]
                 call = f"{callee.symbol}({', '.join(call_args)})"
             else:
-                # Stack arguments are passed by value from the bytes above the callee's home space.
+                # Stack arguments are passed by value from the bytes above the callee's home space. A slot
+                # that the callee never reads is passed as 0; the caller then need not have a frame.
                 passed = [lifter.reg(r) for r in ARGUMENT_REGISTERS] + [
                     f"load<word>(reinterpret_cast<word>(frame + {frame.offsets[ip] + HOME_SIZE + 8 * slot - frame.start}))"
-                    for slot in range(len(stacks.get(ip, ())))]
+                    if width else "0" for slot, width in enumerate(stacks.get(ip, ()))]
                 call = f"fn_{callee.entry:x}({', '.join(passed)})"
             # A tail jump returns the callee's RAX; a call leaves it in RAX.
             if isinstance(callee, HostImport) and callee.return_width == 0:
