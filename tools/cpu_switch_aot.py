@@ -36,6 +36,13 @@ shifted out and ZF, SF and PF come from the result. OF is defined only for a
 count of 1 (MSB of the result XOR CF for SHL, MSB of the operand for SHR, 0 for
 SAR), so O, NO, L, GE, LE and G are refused after a larger count.
 
+BT, BTS, BTR and BTC take a 16-, 32- or 64-bit register or memory bit base and
+a register or immediate bit offset. The offset is taken modulo the operand
+width, except that a register offset into memory addresses a bit string
+outside the operand, which is refused. CF is the selected bit before the
+write; the Intel SDM leaves ZF unaffected and the other flags undefined, so
+only the B and AE conditions may read it.
+
 One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
 and RDX without naming them. Products of up to 32-bit factors are computed in
 std::uint64_t; 64-bit products and all quotients use the MSVC intrinsics
@@ -189,6 +196,8 @@ MAX_CALLEES = 256
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
 ROTATES = {M.ROL: "true", M.ROR: "false"}
+# Bit tests, by the C++ operator that writes the selected bit (BT writes nothing).
+BIT_TESTS = {M.BT: None, M.BTS: "|", M.BTR: "& ~", M.BTC: "^"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
@@ -209,7 +218,7 @@ STRING_TRANSFERS = {
 # which only read them.
 FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -926,6 +935,11 @@ class Lifter:
 
     def condition(self, producer, jcc):
         code = CONDITIONS.get(jcc.condition_code)
+        if producer.mnemonic in BIT_TESTS:
+            # fb is CF, the selected bit. ZF is unaffected and OF, SF, AF and PF are undefined.
+            if code not in ("b", "ae"):
+                raise ValueError(f"only CF is defined after {str(producer).split()[0].upper()} at RVA {jcc.ip:#x}")
+            return "fb != 0" if code == "b" else "fb == 0"
         width = self.width(producer)
         u, s = unsigned(width), signed(width)
         a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
@@ -1117,6 +1131,23 @@ class Lifter:
                 self.flags = True
                 line = f"fa = static_cast<{unsigned(width)}>({value}); " + line
             return line, reads, writes
+        if mnemonic in BIT_TESTS:
+            if ins.op0_kind == OpKind.MEMORY and ins.op1_kind == OpKind.REGISTER:
+                raise ValueError(f"unsupported bit-string operand at RVA {ins.ip:#x}")
+            note(0, 1)
+            bits = width * 8
+            a = self.operand(ins, 0, width)
+            offset = (f"(static_cast<std::uint64_t>({self.operand(ins, 1, width)}) & {bits - 1}u)"
+                      if ins.op1_kind == OpKind.REGISTER else f"{ins.immediate(1) & (bits - 1)}u")
+            lines = []
+            if sets_flags:
+                self.flags = True
+                lines.append(f"fb = (static_cast<std::uint64_t>({a}) >> {offset}) & 1u;")
+            if mnemonic == M.BT:
+                writes.clear()
+            else:
+                lines.append(self.write(ins, width, f"{a} {BIT_TESTS[mnemonic]}(1ull << {offset})"))
+            return " ".join(lines), reads, writes
         if mnemonic in (*SHIFTS, *ROTATES):
             if sets_flags:
                 if mnemonic in ROTATES:
