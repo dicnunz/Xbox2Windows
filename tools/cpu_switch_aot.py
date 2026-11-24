@@ -43,6 +43,15 @@ outside the operand, which is refused. CF is the selected bit before the
 write; the Intel SDM leaves ZF unaffected and the other flags undefined, so
 only the B and AE conditions may read it.
 
+POPCNT, LZCNT and TZCNT take a 16-, 32- or 64-bit register or memory source.
+LZCNT and TZCNT return the operand width for a zero source. As the Intel SDM
+defines their flags, POPCNT sets ZF for a zero source and clears OF, SF, AF, CF
+and PF, so every condition may read them. LZCNT and TZCNT set CF for a zero
+source and ZF for a zero result and leave OF, SF, AF and PF undefined, so only
+B, AE, E, NE, BE and A may read them. The host must support the instructions
+whose results the original computes: without ABM and BMI1 a processor runs
+LZCNT and TZCNT as BSR and BSF.
+
 One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
 and RDX without naming them. Products of up to 32-bit factors are computed in
 std::uint64_t; 64-bit products and all quotients use the MSVC intrinsics
@@ -198,6 +207,8 @@ SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
 ROTATES = {M.ROL: "true", M.ROR: "false"}
 # Bit tests, by the C++ operator that writes the selected bit (BT writes nothing).
 BIT_TESTS = {M.BT: None, M.BTS: "|", M.BTR: "& ~", M.BTC: "^"}
+# Bit counts, by the PRELUDE helper that computes each.
+BIT_COUNTS = {M.POPCNT: "count_ones", M.LZCNT: "leading_zeros", M.TZCNT: "trailing_zeros"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
 SETCC = {getattr(M, "SET" + code) for code in _CODES}
 CMOVCC = {getattr(M, "CMOV" + code) for code in _CODES}
@@ -218,7 +229,7 @@ STRING_TRANSFERS = {
 # which only read them.
 FLAG_NEUTRAL = {M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -940,6 +951,24 @@ class Lifter:
             if code not in ("b", "ae"):
                 raise ValueError(f"only CF is defined after {str(producer).split()[0].upper()} at RVA {jcc.ip:#x}")
             return "fb != 0" if code == "b" else "fb == 0"
+        if producer.mnemonic in BIT_COUNTS:
+            # fa is the source and fb the result.
+            source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
+            if producer.mnemonic == M.POPCNT:
+                # ZF is set for a zero source; OF, SF, AF, CF and PF are cleared.
+                table = {"e": source_zero, "be": source_zero, "le": source_zero, "o": "false", "b": "false",
+                         "s": "false", "p": "false", "l": "false"}
+            else:
+                result_zero = f"static_cast<{unsigned(self.width(producer))}>(fb) == 0"
+                table = {"b": source_zero, "e": result_zero, "be": f"{source_zero} || {result_zero}"}
+            for negated, base in (("no", "o"), ("ae", "b"), ("ne", "e"), ("a", "be"), ("ns", "s"), ("np", "p"),
+                                  ("ge", "l"), ("g", "le")):
+                if base in table:
+                    table[negated] = f"!({table[base]})"
+            if code not in table:
+                name = str(producer).split()[0].upper()
+                raise ValueError(f"OF, SF and PF are undefined after {name} at RVA {jcc.ip:#x}")
+            return table[code]
         width = self.width(producer)
         u, s = unsigned(width), signed(width)
         a, b = f"static_cast<{u}>(fa)", f"static_cast<{u}>(fb)"
@@ -1148,6 +1177,14 @@ class Lifter:
             else:
                 lines.append(self.write(ins, width, f"{a} {BIT_TESTS[mnemonic]}(1ull << {offset})"))
             return " ".join(lines), reads, writes
+        if mnemonic in BIT_COUNTS:
+            note(1)
+            source = self.operand(ins, 1, width)
+            value = f"{BIT_COUNTS[mnemonic]}<{unsigned(width)}>({source})"
+            if not sets_flags:
+                return self.write(ins, width, value), reads, writes
+            self.flags = True
+            return (f"fa = {source}; fb = {value}; " + self.write(ins, width, "fb")), reads, writes
         if mnemonic in (*SHIFTS, *ROTATES):
             if sets_flags:
                 if mnemonic in ROTATES:
@@ -1963,6 +2000,22 @@ template <class T> static inline T rotate_bits(T value, word count, bool left) {
     const unsigned amount = left ? shift : bits - shift;
     const word wide = value;
     return static_cast<T>((wide << amount) | (wide >> (bits - amount)));
+}
+// POPCNT, LZCNT and TZCNT, at the width of T; LZCNT and TZCNT of 0 are the width.
+template <class T> static inline T count_ones(T value) {
+    unsigned count = 0;
+    for (word bits = value; bits != 0; bits &= bits - 1) ++count;
+    return static_cast<T>(count);
+}
+template <class T> static inline T leading_zeros(T value) {
+    unsigned count = 0;
+    while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> (sizeof(T) * 8 - 1 - count)) & 1u) == 0) ++count;
+    return static_cast<T>(count);
+}
+template <class T> static inline T trailing_zeros(T value) {
+    unsigned count = 0;
+    while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> count) & 1u) == 0) ++count;
+    return static_cast<T>(count);
 }
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {
