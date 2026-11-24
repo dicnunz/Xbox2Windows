@@ -127,9 +127,8 @@ once, as a static function named fn_<rva> that takes RCX, RDX, R8 and R9,
 defined before its first caller. A target must be the first byte of a verified
 primary runtime function (unchained, version 1 or 2 unwind data, executable) or
 a non-forwarded code export that no other function's interval holds; chained
-ranges, interior labels, forwarded and data exports are refused. A call
-to the caller's own entry and any call cycle are refused, and a caller is
-refused when any callee is. A callee records how many low bytes of each argument
+ranges, interior labels, forwarded and data exports are refused. A caller
+is refused when any callee is. A callee records how many low bytes of each argument
 register it may read before writing it, and the caller must define them at the
 call. After a call RAX holds the callee's return width of defined bytes; the
 other volatile registers, the flags and the callee's 32-byte home space at RSP
@@ -142,6 +141,15 @@ mod 16 from entry at a call, with the callee's home space below the return
 address. A tail jump is checked as a RET and contributes the callee's return
 width. The callee's frame is its own array, so no frame address crosses a call,
 and stack arguments stay refused.
+
+A CALL may close a call cycle, an export's own entry included, which becomes an
+internal function too. A call into a function whose translation is in progress
+uses an assumed return width and demands, at first 8 bytes and none, and the
+functions of the cycle are translated again from the meet of the assumed and
+computed values until no computed width is lower and no demand higher. Each
+function of a cycle is declared before the definitions. A tail jump that closes
+a cycle is refused: the original runs such a cycle in constant stack. The host
+stack bounds the depth of recursion, at a depth that differs from the original.
 
 A target without unwind data or export is refused, with a message saying that
 a range binding is needed, unless the invoker supplies one: --bind-ranges names
@@ -525,8 +533,6 @@ class Function:
     def callee(self, ins):
         """Validate the target of a direct CALL as the entry of another function in the image."""
         target = ins.near_branch_target
-        if target == self.entry:
-            raise ValueError(f"self-recursion at RVA {ins.ip:#x}")
         if not 0 <= target < self.pe.OPTIONAL_HEADER.SizeOfImage:
             raise ValueError(f"call target outside the image at RVA {ins.ip:#x}")
         section = self.pe.get_section_by_rva(target)
@@ -1797,9 +1803,30 @@ class HostImport(NamedTuple):
         return dict(zip(ARGUMENT_REGISTERS, self.widths))
 
 
+class Assumed(NamedTuple):
+    """The summary that calls into a function still being translated use: its return width and
+    argument demands, assumed until its translation computes them."""
+    entry: int
+    return_width: int
+    demands: dict
+
+
+def at_least_as_good(computed, assumed):
+    """Whether a computed summary defines at least the assumed RAX bytes and demands no more."""
+    return (computed.return_width >= assumed.return_width
+            and all(width <= assumed.demands.get(r, 0) for r, width in computed.demands.items()))
+
+
 class Program:
     """The functions of one image reached from the requested exports through direct calls and tail
-    jumps. Each callee is translated once, in internal mode, and its source precedes its callers'."""
+    jumps. Each callee is translated once, in internal mode, and its source precedes its callers'.
+
+    A call to an internal function whose translation is in progress closes a call cycle. It uses an
+    assumed summary, at first 8 defined RAX bytes and no demands. Each function of the cycle is
+    translated again with the meet of the assumed and computed summaries until each computed
+    summary defines at least the assumed bytes and demands no more. Its returns then define those
+    bytes and it reads no more, by induction on the depth of calls that return. The functions of a
+    cycle are kept once its first function is done, after declarations, so each may call any other."""
 
     def __init__(self, pe, bindings=None, *, image_data=False, imports=None, host_cpu=False):
         self.pe = pe
@@ -1807,41 +1834,81 @@ class Program:
         self.host_cpu = host_cpu
         self.imports = imports or {}
         self.entries = Entries(pe, bindings)
-        self.active = []
+        self.active = []  # (entry, internal) of each translation in progress, outermost first
+        self.lows = []  # per active translation: the lowest active depth it has used a summary from
+        self.assumed = {}
+        self.pending = []  # (entry, source, function, low) of cycle functions not yet kept
         self.callees = {}
         self.refused = {}
         self.sources = []
         self.import_resolver = None
 
     def lift(self, entry, symbol, arguments, internal=False):
-        self.active.append(entry)
+        self.active.append((entry, internal))
+        self.lows.append(len(self.active) - 1)
         try:
             return lift_function(self, entry, symbol, arguments, internal)
         finally:
             self.active.pop()
+            self.low = self.lows.pop()
+            if self.lows:
+                self.lows[-1] = min(self.lows[-1], self.low)
+
+    def depends(self, depth):
+        self.lows[-1] = min(self.lows[-1], depth)
+
+    def committed(self, callee):
+        return isinstance(callee, HostImport) or self.callees.get(callee.entry) is callee
 
     def callee(self, target, ip):
         if target in self.refused:
             raise ValueError(f"callee at RVA {target:#x} refused: {self.refused[target]}")
         if target in self.callees:
             return self.callees[target]
-        if target in self.active:
-            cycle = self.active[self.active.index(target):] + [target]
-            raise ValueError(f"mutual recursion: call cycle {' -> '.join(f'{rva:#x}' for rva in cycle)} "
-                             f"at RVA {ip:#x}")
-        if len(self.callees) >= MAX_CALLEES:
+        for entry, _, function, low in self.pending:
+            if entry == target:
+                self.depends(low)
+                return function
+        depth = next((d for d, (entry, internal) in enumerate(self.active) if internal and entry == target), None)
+        if depth is not None:
+            self.depends(depth)
+            return self.assumed.setdefault(target, Assumed(target, 8, {}))
+        if len(self.callees) + len(self.pending) >= MAX_CALLEES:
             raise ValueError(f"callee limit reached at RVA {ip:#x}")
-        try:
-            source, function = self.lift(target, f"fn_{target:x}", ARGUMENT_REGISTERS, internal=True)
-        except ValueError as error:
-            self.refused[target] = str(error)
-            raise ValueError(f"callee at RVA {target:#x} refused: {error}") from None
-        if function.return_width is None:
-            error = "no reachable normal return"
-            self.refused[target] = error
-            raise ValueError(f"callee at RVA {target:#x} refused: {error}")
-        self.callees[target] = function
-        self.sources.append(source)
+        depth = len(self.active)
+        start = len(self.pending)
+        while True:
+            try:
+                source, function = self.lift(target, f"fn_{target:x}", ARGUMENT_REGISTERS, internal=True)
+                if function.return_width is None:
+                    raise ValueError("no reachable normal return")
+            except ValueError as error:
+                del self.pending[start:]
+                self.assumed.pop(target, None)
+                self.refused[target] = str(error)
+                raise ValueError(f"callee at RVA {target:#x} refused: {error}") from None
+            assumed = self.assumed.get(target)
+            if assumed is None or at_least_as_good(function, assumed):
+                break
+            # Translate the cycle again from a summary that both bounds.
+            demands = {r: max(width, function.demands.get(r, 0))
+                       for r, width in assumed.demands.items()} | {
+                       r: width for r, width in function.demands.items() if r not in assumed.demands}
+            self.assumed[target] = Assumed(target, min(assumed.return_width, function.return_width), demands)
+            del self.pending[start:]
+        if self.low < depth:
+            # Part of a cycle through a function below it on the stack, which keeps it when that is done.
+            self.pending.append((target, source, function, self.low))
+            return function
+        members = [(entry, text, member) for entry, text, member, _ in self.pending[start:]] + [(target, source, function)]
+        del self.pending[start:]
+        cyclic = [self.assumed.pop(entry, None) for entry, _, _ in members]
+        if any(cyclic) or len(members) > 1:
+            self.sources.append("\n".join(f"static word fn_{entry:x}({', '.join(f'word {NAMES[r]}' for r in ARGUMENT_REGISTERS)});"
+                                          for entry, _, _ in sorted(members, key=lambda m: m[0])))
+        for entry, text, member in members:
+            self.callees[entry] = member
+            self.sources.append(text)
         return function
 
 
@@ -1909,7 +1976,11 @@ def lift_function(program, entry, symbol, arguments, internal):
     callees = {ip: (function.host_calls[ip] if ip in function.host_calls
                     else program.callee(target, ip))
                for ip, target in sorted({**function.calls, **function.tails}.items())}
-    loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
+    for ip in sorted(function.tails):
+        if not program.committed(callees[ip]):
+            # The original runs a cycle of tail jumps in constant stack; the host call does not.
+            raise ValueError(f"tail jump within a call cycle at RVA {ip:#x}")
+    loads ={sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
     body = {}
     effects = {}

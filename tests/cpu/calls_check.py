@@ -9,6 +9,7 @@ be emitted once, and patched copies must be refused with their stated reason.
 import ctypes
 from pathlib import Path
 import random
+import re
 import struct
 import sys
 
@@ -173,9 +174,12 @@ def check(probe_path, original_path, lifted_path):
 # the callees' RVAs as {leaf}, {mid} and {low}.
 CALL = "e8 ?? ?? ?? ??"
 CONTROLS = [
-    ("call_leaf", [("call_leaf", 0x08, CALL, ("call", "call_leaf"))], "self-recursion"),
-    ("chain3", [("mid", 0x0c, CALL, ("call", "chain3"))],
-     "callee at RVA {mid:#x} refused: mutual recursion: call cycle"),
+    # Recursion through CALL is translated (tests/cpu/recursion_check.py); a cycle that a tail jump
+    # closes is not. A reason of None means the patched copy must translate.
+    ("call_leaf", [("call_leaf", 0x08, CALL, ("call", "call_leaf"))], None),
+    ("chain3", [("mid", 0x0c, CALL, ("call", "chain3"))], None),
+    ("tail_after_frame", [("mid", 0x0c, CALL, ("call", "tail_after_frame"))],
+     "callee at RVA {mid:#x} refused: callee at RVA {tail_after_frame:#x} refused: tail jump within a call cycle"),
     ("call_leaf", [("call_leaf", 0x08, CALL, ("call", ("leaf", 1)))], "is not a function entry"),
     ("call_leaf", [("call_leaf", 0x08, CALL, ("call", ("leaf", 4)))], "is not a function entry"),
     ("call_leaf", [("call_leaf", 0x08, CALL, ("call", ("rva", "end")))], "call target outside the image"),
@@ -236,7 +240,7 @@ def check_rejections(original_path):
         with TemporaryDirectory() as folder:
             path = Path(folder) / "control.dll"
             for name, patches, reason in CONTROLS:
-                reason = reason.format(**rvas)
+                reason = None if reason is None else reason.format(**rvas)
                 damaged = bytearray(data)
                 sites = []
                 for function, delta, before, after in patches:
@@ -263,6 +267,12 @@ def check_rejections(original_path):
                             raise AssertionError(f"unexpected encoding for control {reason!r} in {function}")
                     damaged[at:at + len(after)] = after
                 path.write_bytes(damaged)
+                if reason is None:
+                    source, _ = aot.translate(path, [name])
+                    if not re.search(r"^static word fn_[0-9a-f]+\(word rcx, word rdx, word r8, word r9\);$", source, re.M):
+                        raise AssertionError(f"{name} control ({', '.join(sites)}) has no declared call cycle")
+                    print(f"control {name} ({', '.join(sites)}): translated with a declared call cycle")
+                    continue
                 try:
                     aot.translate(path, [name])
                 except ValueError as error:
