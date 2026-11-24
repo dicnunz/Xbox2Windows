@@ -329,4 +329,73 @@ bad_b PROC FRAME
     ret
 bad_b ENDP
 
+
+; Refused: stale_a reads all of RAX after stale_t, which returns only AL through the cycle
+; stale_a -> stale_s -> stale_q -> stale_s -> stale_a. stale_t is translated after stale_s and
+; stale_q are pending and reuses stale_q, so it is in the same cycle and must not be kept on its own.
+stale_a PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    test rcx, rcx
+    jnz stale_a_step
+    mov al, 1
+    add rsp, 28h
+    ret
+stale_a_step:
+    dec rcx
+    jz stale_a_t
+    call stale_s
+    add rsp, 28h
+    ret
+stale_a_t:
+    call stale_t
+    inc rax
+    add rsp, 28h
+    ret
+stale_a ENDP
+
+stale_s PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    test rcx, rcx
+    jz stale_s_a
+    call stale_q
+    add rsp, 28h
+    ret
+stale_s_a:
+    call stale_a
+    add rsp, 28h
+    ret
+stale_s ENDP
+
+stale_q PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    dec rcx
+    call stale_s
+    add rsp, 28h
+    ret
+stale_q ENDP
+
+stale_t PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    call stale_q
+    add rsp, 28h
+    ret
+stale_t ENDP
+
+stale_e PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    call stale_a
+    add rsp, 28h
+    ret
+stale_e ENDP
+
 END

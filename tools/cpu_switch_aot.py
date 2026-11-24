@@ -1898,6 +1898,9 @@ class Program:
             del self.pending[start:]
         if self.low < depth:
             # Part of a cycle through a function below it on the stack, which keeps it when that is done.
+            # The functions pending from its translation now depend on what it depends on: a later
+            # translation at this depth that reuses one is in the same cycle.
+            self.pending[start:] = [(e, t, f, min(l, self.low)) for e, t, f, l in self.pending[start:]]
             self.pending.append((target, source, function, self.low))
             return function
         members = [(entry, text, member) for entry, text, member, _ in self.pending[start:]] + [(target, source, function)]
@@ -1980,7 +1983,7 @@ def lift_function(program, entry, symbol, arguments, internal):
         if not program.committed(callees[ip]):
             # The original runs a cycle of tail jumps in constant stack; the host call does not.
             raise ValueError(f"tail jump within a call cycle at RVA {ip:#x}")
-    loads ={sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
+    loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
     body = {}
     effects = {}

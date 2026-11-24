@@ -24,6 +24,7 @@ REFUSED = (
     ("wide_odd", "undefined register rax"),
     ("lost_k", "callee argument r8 is undefined"),
     ("bad_a", "callee at RVA {bad_b:#x} refused: unsupported instruction"),
+    ("stale_e", "callee at RVA {stale_a:#x} refused: undefined register rax"),
 )
 # Refused only because a cycle's first summary is translated again.
 ITERATED = ("wide_odd", "lost_k")
@@ -139,6 +140,7 @@ def layout(pe, export_rva, aot):
     rvas["walk_c"], rvas["count_down"] = targets(rvas["walk_b"])
     rvas["tail_pong"], = targets(rvas["tail_ping"])
     rvas["bad_b"], = targets(rvas["bad_a"])
+    rvas["stale_a"], = targets(rvas["stale_e"])
     return rvas
 
 
